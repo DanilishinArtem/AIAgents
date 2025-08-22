@@ -39,7 +39,7 @@ class HMMTwoAgentsFeatures:
         self.l2_eta = float(l2_eta)  # L2 for η
 
     # Safe version of the logsum exponent function 
-    # log⁡〖(∑8_𝑖▒𝑒^(𝑥_𝑖 ) )=𝑚+log⁡(∑_𝑖▒〖𝑒^(𝑥_𝑖 )−𝑚〗),𝑚=max_𝑖⁡〖𝑥_𝑖 〗 〗
+    # log⁡〖(∑8_𝑖 𝑒^(𝑥_𝑖 ) )=𝑚+log⁡(∑_𝑖 〖𝑒^(𝑥_𝑖 )−𝑚〗),𝑚=max_𝑖⁡〖𝑥_𝑖 〗 〗
     def logsumexp(self, x, axis=None):
         m = np.max(x, axis=axis, keepdims=True)
         return (m + np.log(np.sum(np.exp(x - m), axis=axis, keepdims=True))).squeeze(axis)
