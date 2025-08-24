@@ -44,11 +44,9 @@ class HMMTwoAgentsFeatures:
         m = np.max(x, axis=axis, keepdims=True)
         return (m + np.log(np.sum(np.exp(x - m), axis=axis, keepdims=True))).squeeze(axis)
 
-    # ---------- вспомогательные вероятности ----------
+    # ---------- Additional probabilities ----------
     def _logp_z_given_s(self, s: int) -> np.ndarray:
-        """
-        Возвращает log p(z1=a, z2=b | s) как матрицу (A, A) в нормировке softmax.
-        """
+        # log⁡〖(𝑝(𝑧_1=𝑎,𝑧_2=𝑏|𝑠,𝜂))=𝜃_(𝑠,𝑎)^((1))+𝜃_(𝑠,𝑏)^((2))+𝑊_(𝑠,𝑎𝑏)−log⁡(∑𝜃_(𝑠,𝑎′)^((1) )+𝜃_(𝑠,𝑏′)^((2) )+𝑊_(𝑠,𝑎′𝑏′) ) 〗
         scores = self.theta1[s][:, None] + self.theta2[s][None, :] + self.W[s]  # (A,A)
         logZ = self.logsumexp(scores.ravel())
         return scores - logZ
@@ -60,6 +58,8 @@ class HMMTwoAgentsFeatures:
         return -0.5 * (np.sum(np.log(2*np.pi*var_safe) + (x-mean)**2 / var_safe))
 
     def _log_emission(self, s: int, z1: int, z2: int, x1: np.ndarray, x2: np.ndarray) -> float:
+        # p(observations|hidden_states), where
+        # observations: z1, z2, x1, x2
         logPz = self._logp_z_given_s(s)[z1, z2]
         logPx1 = self._gaussian_logpdf_diag(x1, self.phi_mean[s,0,z1], self.phi_var[s,0,z1])
         logPx2 = self._gaussian_logpdf_diag(x2, self.phi_mean[s,1,z2], self.phi_var[s,1,z2])
@@ -67,11 +67,7 @@ class HMMTwoAgentsFeatures:
 
     # ---------- forward-backward ----------
     def _forward_backward(self, z_seq: np.ndarray, x_seq: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
-        """
-        z_seq: (T,2) ints
-        x_seq: (T,2,F) floats
-        returns: gamma (T,K), xi (T-1,K,K), loglik
-        """
+        # part of calculation b_t(s) = p(z1, z2 | s) * p(x_1|z_1,s) * p(x_2|z_2,s)
         T = z_seq.shape[0]
         logB = np.empty((T, self.K))
         for t in range(T):
@@ -80,7 +76,9 @@ class HMMTwoAgentsFeatures:
             for s in range(self.K):
                 logB[t, s] = self._log_emission(s, z1, z2, x1, x2)
 
+
         # forward in log-domain with scaling
+        # 𝛼_(𝑡+1) (𝑠^′ )=(∑_𝑠▒〖𝛼_𝑡 (𝑠)Π(𝑠^′ |𝑠) 〗) 𝑏_(𝑡+1) (𝑠^′ )
         log_alpha = np.empty((T, self.K))
         log_alpha[0] = np.log(np.maximum(self.pi, self.EPS)) + logB[0]
         c0 = self.logsumexp(log_alpha[0])
@@ -95,7 +93,8 @@ class HMMTwoAgentsFeatures:
             log_scales[t] = ct
         loglik = np.sum(log_scales)
 
-        # backward
+        # backward in log-domain with scaling
+        # 𝛽_𝑡 (𝑠)=∑_𝑠′▒〖Π(𝑠^′ |𝑠) 𝑏_(𝑡+1) (𝑠^′ ) 𝛽_(𝑡+1) (𝑠^′ ) 〗
         log_beta = np.empty((T, self.K))
         log_beta[-1] = 0.0
         for t in range(T-2, -1, -1):
@@ -106,12 +105,14 @@ class HMMTwoAgentsFeatures:
             log_beta[t] -= c
 
         # gamma
+        # 𝛾_𝑡 (𝑠)=(𝛼_𝑡 (𝑠) 𝛽_𝑡 (𝑠))/(∑2_𝑢▒〖𝛼_𝑡 (𝑢) 〗 𝛽_𝑡 (𝑢) )
         log_gamma = log_alpha + log_beta
         # normalize per t
         log_gamma = (log_gamma.T - self.logsumexp(log_gamma, axis=1)).T
         gamma = np.exp(log_gamma)
 
         # xi
+        # 𝜉_𝑡 (𝑠,𝑠^′ )=(𝛼_𝑡 (𝑠)Π(𝑠^′│𝑠) 𝑏_(𝑡+1) (𝑠^′ ) 𝛽_(𝑡+1) (𝑠^′ ))/(∑2_(𝑢,𝑣)▒〖𝛼_𝑡 (𝑢)Π(𝑣│𝑢) 𝑏_(𝑡+1) (𝑣) 𝛽_(𝑡+1) (𝑣) 〗)
         xi = np.zeros((T-1, self.K, self.K))
         for t in range(T-1):
             # unnormalized in log
@@ -121,22 +122,15 @@ class HMMTwoAgentsFeatures:
 
         return gamma, xi, loglik
 
-    # ---------- M-step: η (лог-линейная оптимизация) ----------
-    def _optimize_eta_for_state(self, s: int, C_pair: np.ndarray, n_s: float,
-                                max_iter: int = 200, lr: float = 0.5) -> None:
-        """
-        Оптимизирует (theta1[s], theta2[s], W[s]) по взвешенному log-likelihood:
-          L_s(η) = sum_{a,b} C_pair[a,b] * score[a,b] - n_s * self.logsumexp(score) - (l2/2)||η||^2
-        где score[a,b] = θ1[a] + θ2[b] + W[a,b]
-        Используем простой градиентный подъём с backtracking line search.
-        """
+    # ---------- M-step: η (log-linear optimization) ----------
+    def _optimize_eta_for_state(self, s: int, C_pair: np.ndarray, n_s: float, max_iter: int = 200, lr: float = 0.5) -> None:
+        # C_pair: a matrix of counters (empirical statistics), for example, how many times 
+        # the pair (z₁,z₂) appeared in the data when the hidden state was s
         if n_s <= 0:
             return
-
         th1 = self.theta1[s].copy()
         th2 = self.theta2[s].copy()
         W = self.W[s].copy()
-
         def pack(th1, th2, W):
             return th1, th2, W
 
@@ -145,12 +139,13 @@ class HMMTwoAgentsFeatures:
             logZ = self.logsumexp(scores.ravel())
             P = np.exp(scores - logZ)                          # softmax (A,A)
 
-            # obj
+            # obj: an empirical coincidence (how well does the model explain the data)
             obj = np.sum(C_pair * scores) - n_s * logZ
-            # L2
+            # L2 regularization
             obj -= 0.5 * self.l2_eta * (np.sum(th1**2) + np.sum(th2**2) + np.sum(W**2))
 
             # grads (empirical - n_s * model) - λ * θ
+            # gradient = empirical statistics − model−expected statistics - regularization
             G_pair = C_pair - n_s * P                          # (A,A)
             g_th1 = np.sum(G_pair, axis=1) - self.l2_eta * th1 # (A,)
             g_th2 = np.sum(G_pair, axis=0) - self.l2_eta * th2 # (A,)
@@ -158,7 +153,6 @@ class HMMTwoAgentsFeatures:
             return obj, g_th1, g_th2, g_W
 
         prev_obj, _, _, _ = objective_and_grad(th1, th2, W)
-
         for it in range(max_iter):
             obj, g1, g2, gW = objective_and_grad(th1, th2, W)
             # backtracking line search
@@ -169,50 +163,47 @@ class HMMTwoAgentsFeatures:
                 th2_new = th2 + step * g2
                 W_new   = W   + step * gW
                 obj_new, _, _, _ = objective_and_grad(th1_new, th2_new, W_new)
-                if obj_new >= obj - 1e-9:  # не ухудшилось
+                if obj_new >= obj - 1e-9:  # not became worse
                     th1, th2, W = th1_new, th2_new, W_new
                     prev_obj = obj_new
                     improved = True
                     break
                 step *= 0.5
             if not improved:
-                # малый шаг — прекращаем
+                # less then epsilong, we can break it
                 break
-
         self.theta1[s], self.theta2[s], self.W[s] = pack(th1, th2, W)
 
-    # ---------- M-step: Φ (взвешенные гауссовы MLE) ----------
+    # ---------- M-step: Φ (weighted gaussian MLE) ----------
     def _update_phi(self, stats: List[Tuple[np.ndarray, np.ndarray, np.ndarray]]):
-        """
-        stats: список по последовательностям [(gamma, z_seq, x_seq)]
-        Обновляет mean/var для каждого (s, i, a).
-        """
         K, A, F = self.K, self.A, self.F
-        # аккумулируем суммы
-        sum_w = np.zeros((K, 2, A))
-        sum_x = np.zeros((K, 2, A, F))
-        sum_x2 = np.zeros((K, 2, A, F))
+        # sum accumulation
+        sum_w = np.zeros((K, 2, A)) # accumulated weight (gamma)
+        sum_x = np.zeros((K, 2, A, F)) # accumulated sum of observations x
+        sum_x2 = np.zeros((K, 2, A, F)) # accumulated sum of observations x^2
 
         for gamma, z_seq, x_seq in stats:
             T = z_seq.shape[0]
             for t in range(T):
-                z1, z2 = z_seq[t]
-                x1, x2 = x_seq[t,0], x_seq[t,1]
+                z1, z2 = z_seq[t] # actions of agents
+                x1, x2 = x_seq[t,0], x_seq[t,1] # observations of agents
                 for s in range(K):
-                    w = gamma[t, s]
+                    w = gamma[t, s] # probability p(s_t = s | datas)
                     if w <= 0: 
                         continue
-                    # агент 1, действие z1
-                    sum_w[s,0,z1] += w
-                    sum_x[s,0,z1] += w * x1
-                    sum_x2[s,0,z1] += w * (x1**2)
-                    # агент 2, действие z2
-                    sum_w[s,1,z2] += w
-                    sum_x[s,1,z2] += w * x2
-                    sum_x2[s,1,z2] += w * (x2**2)
+                    # agent 1, action z1
+                    sum_w[s,0,z1] += w # accumulated weight for agent 1
+                    sum_x[s,0,z1] += w * x1 # accumulate statistic for mean for agent 1
+                    sum_x2[s,0,z1] += w * (x1**2) # accumulate statistic for deviation for agent 1
+                    # agent 2, action z2
+                    sum_w[s,1,z2] += w # accumulated weight for agent 2
+                    sum_x[s,1,z2] += w * x2 # accumulate satistic for mean for agent 2
+                    sum_x2[s,1,z2] += w * (x2**2) # accumulate statistic for deviation for agent 2
 
-        # обновление mean/var
+        # update mean/var
+        # 𝜇=(∑𝑤_𝑡 𝑥_𝑡)/(∑𝑤_𝑡 )
         mean = np.copy(self.phi_mean)
+        # 𝜎^2=(∑𝑤_𝑡 𝑥_𝑡^2)/(∑𝑤_𝑡 )−𝜇^2
         var = np.copy(self.phi_var)
         for s in range(K):
             for i in range(2):
@@ -220,42 +211,36 @@ class HMMTwoAgentsFeatures:
                     w = sum_w[s,i,a]
                     if w > 0:
                         m = sum_x[s,i,a] / w
-                        # дисперсия по координатам (диагональ)
+                        # deviation through coordinates
                         v = (sum_x2[s,i,a] / w) - (m**2)
-                        v = np.maximum(v, 1e-6)  # floor
+                        v = np.maximum(v, 1e-6)
                         mean[s,i,a] = m
                         var[s,i,a] = v
         self.phi_mean = mean
         self.phi_var = var
 
-    # ---------- внешний EM ----------
-    def fit_em(self, sequences: List[Tuple[np.ndarray, np.ndarray]],
-               n_iter: int = 50, tol: float = 1e-4, verbose: bool = True):
-        """
-        sequences: список из (z_seq, x_seq)
-          z_seq: (T,2) int
-          x_seq: (T,2,F) float
-        """
+    # ---------- total EM algorithm ----------
+    def fit_em(self, sequences: List[Tuple[np.ndarray, np.ndarray]], n_iter: int = 50, tol: float = 1e-4, verbose: bool = True):
         prev_ll = -np.inf
         for it in range(1, n_iter+1):
             total_ll = 0.0
-            # достаточные статистики
-            N0 = np.zeros(self.K)
-            Nij = np.zeros((self.K, self.K))
-            all_stats = []  # для Φ
-            # для η: аккумулируем по состояниям C_pair[s, a, b]
-            C_pair_all = np.zeros((self.K, self.A, self.A))
-            n_s = np.zeros(self.K)
+            # statistics
+            N0 = np.zeros(self.K) # for initial probabilities π
+            Nij = np.zeros((self.K, self.K)) # for transitions Π
+            all_stats = []  # for Φ (mean/deviations of observations)
+            # for η: accumulate for states C_pair[s, a, b]
+            C_pair_all = np.zeros((self.K, self.A, self.A)) # for η (matrix of quantity of pairs actions of agens for given hidden state)
+            n_s = np.zeros(self.K) # normalization (total mass in state s)
 
             # --- E-step ---
             for z_seq, x_seq in sequences:
                 gamma, xi, ll = self._forward_backward(z_seq, x_seq)
                 total_ll += ll
-                T = z_seq.shape[0]
                 N0 += gamma[0]
                 Nij += xi.sum(axis=0)
                 all_stats.append((gamma, z_seq, x_seq))
-                # статистики для η
+                # statistics for η
+                T = z_seq.shape[0]
                 for t in range(T):
                     a, b = z_seq[t]
                     for s in range(self.K):
@@ -269,11 +254,11 @@ class HMMTwoAgentsFeatures:
             self.Pi = Nij + self.psi
             self.Pi /= self.Pi.sum(axis=1, keepdims=True)
 
-            # --- M-step: η per state (градиентный подъём) ---
+            # --- M-step: η per state (gradient roll) ---
             for s in range(self.K):
                 self._optimize_eta_for_state(s, C_pair_all[s], n_s[s], max_iter=200, lr=0.5)
 
-            # --- M-step: Φ (взвешенные гауссовы MLE по (s,i,a)) ---
+            # --- M-step: Φ (weighted gaussian MLE through (s,i,a)) ---
             self._update_phi(all_stats)
 
             if verbose:
@@ -287,10 +272,6 @@ class HMMTwoAgentsFeatures:
 
     # ---------- генерация выборки ----------
     def sample(self, T: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Генерирует траекторию длины T.
-        Возвращает: states (T,), z_seq (T,2), x_seq (T,2,F).
-        """
         s = np.empty(T, dtype=int)
         z = np.empty((T,2), dtype=int)
         x = np.empty((T,2,self.F), dtype=float)
@@ -300,7 +281,7 @@ class HMMTwoAgentsFeatures:
             if t > 0:
                 s[t] = self.rng.choice(self.K, p=self.Pi[s[t-1]])
             k = s[t]
-            # сэмплируем (z1,z2) ~ softmax(scores)
+            # sampliing (z1,z2) ~ softmax(scores)
             scores = self.theta1[k][:, None] + self.theta2[k][None, :] + self.W[k]
             probs = np.exp(scores - self.logsumexp(scores.ravel()))
             probs = probs / probs.sum()
@@ -308,14 +289,14 @@ class HMMTwoAgentsFeatures:
             idx = self.rng.choice(self.A*self.A, p=flat)
             z1, z2 = idx // self.A, idx % self.A
             z[t] = [z1, z2]
-            # сэмплируем x_i ~ N(mean_{k,i,z_i}, diag(var_{k,i,z_i}))
+            # sampling x_i ~ N(mean_{k,i,z_i}, diag(var_{k,i,z_i}))
             for i, zi in enumerate((z1, z2)):
                 mean = self.phi_mean[k, i, zi]
                 var = np.maximum(self.phi_var[k, i, zi], 1e-8)
                 x[t, i] = self.rng.normal(loc=mean, scale=np.sqrt(var))
         return s, z, x
 
-    # ---------- Viterbi (по желанию) ----------
+    # ---------- Viterbi ----------
     def viterbi(self, z_seq: np.ndarray, x_seq: np.ndarray) -> np.ndarray:
         """
         Находит MAP-путь состояний s_{1:T} по Viterbi в лог-домене.
